@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -56,12 +57,23 @@ class PositionStore(private val dataStore: DataStore<Preferences>) {
         return result
     }
 
+    /** Ids of books hidden from the main list. Positions are kept, so unarchiving resumes. */
+    suspend fun archived(): Set<String> = dataStore.data.first()[ARCHIVED_KEY].orEmpty()
+
+    suspend fun setArchived(bookId: String, archived: Boolean) {
+        dataStore.edit { prefs ->
+            val current = prefs[ARCHIVED_KEY].orEmpty()
+            prefs[ARCHIVED_KEY] = if (archived) current + bookId else current - bookId
+        }
+    }
+
     private fun decode(raw: String): SavedPosition? =
         runCatching { json.decodeFromString(SavedPosition.serializer(), raw) }.getOrNull()
 
     private companion object {
         const val POS_PREFIX = "pos:"
         const val DUR_PREFIX = "dur:"
+        val ARCHIVED_KEY = stringSetPreferencesKey("archived")
     }
 }
 

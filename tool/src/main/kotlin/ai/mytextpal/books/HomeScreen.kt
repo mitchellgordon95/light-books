@@ -1,6 +1,8 @@
 package ai.mytextpal.books
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -41,6 +43,7 @@ data class BookRow(
     val book: Book,
     val saved: SavedPosition?,
     val progress: BookProgress,
+    val archived: Boolean = false,
 ) {
     val started: Boolean get() = saved != null && !saved.finished && progress.listenedMs > 0L
     val status: String get() = statusLine(progress, saved)
@@ -48,9 +51,10 @@ data class BookRow(
 
 class HomeViewModel(private val store: PositionStore) : LightViewModel<Unit>() {
 
-    /** null = not scanned yet. */
+    /** null = not scanned yet. Archived books are included, flagged. */
     val rows = MutableStateFlow<List<BookRow>?>(null)
     val access = MutableStateFlow(Library.Access.UNKNOWN)
+    val showArchived = MutableStateFlow(false)
     private var refreshJob: Job? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
@@ -78,11 +82,20 @@ class HomeViewModel(private val store: PositionStore) : LightViewModel<Unit>() {
         }
     }
 
+    fun refreshNow() {
+        viewModelScope.launch { refresh() }
+    }
+
+    fun toggleShowArchived() {
+        showArchived.value = !showArchived.value
+    }
+
     private suspend fun refresh() {
         val positions = store.loadAll()
+        val archived = store.archived()
         rows.value = Library.scan().map { book ->
             val saved = positions[book.id]
-            BookRow(book, saved, bookProgress(store.partDurations(book), saved))
+            BookRow(book, saved, bookProgress(store.partDurations(book), saved), archived = book.id in archived)
         }
     }
 }
@@ -104,11 +117,18 @@ class HomeScreen(private val sealedActivity: SealedLightActivity) :
         navigateTo(::PlayerScreen)
     }
 
+    private fun openOptions(row: BookRow) {
+        navigateTo({ BookOptionsScreen(it, row, row.archived) }) { changed ->
+            if (changed) viewModel.refreshNow()
+        }
+    }
+
     @Composable
     override fun Content() {
         val colors by LightThemeController.colors.collectAsState()
         val rows by viewModel.rows.collectAsState()
         val access by viewModel.access.collectAsState()
+        val showArchived by viewModel.showArchived.collectAsState()
         val current by Playback.book.collectAsState()
         val playing by Playback.isPlaying.collectAsState()
         val fault by Playback.fault.collectAsState()
@@ -159,20 +179,58 @@ class HomeScreen(private val sealedActivity: SealedLightActivity) :
                         )
                         list.isEmpty() -> EmptyLibrary()
                         else -> {
-                            val continueRow = list.filter { it.started }.maxByOrNull { it.saved?.updatedAt ?: 0L }
+                            val active = list.filter { !it.archived }
+                            val archived = list.filter { it.archived }
+                            val continueRow = active.filter { it.started }.maxByOrNull { it.saved?.updatedAt ?: 0L }
                             if (continueRow != null) {
                                 MenuRow(
                                     title = "CONTINUE",
                                     subtitle = continueRow.book.title,
                                     detail = continueRow.status,
                                     onClick = { openBook(continueRow.book) },
+                                    onLongClick = { openOptions(continueRow) },
                                 )
                             }
-                            list.forEach { row ->
+                            active.forEach { row ->
                                 MenuRow(
                                     title = row.book.title,
                                     subtitle = row.status,
                                     onClick = { openBook(row.book) },
+                                    onLongClick = { openOptions(row) },
+                                )
+                            }
+                            if (active.isEmpty()) {
+                                LightText(
+                                    text = "Everything is archived.",
+                                    variant = LightTextVariant.Copy,
+                                    lighten = true,
+                                    modifier = Modifier.padding(vertical = 0.75f.gridUnitsAsDp()),
+                                )
+                            }
+                            if (archived.isNotEmpty()) {
+                                MenuRow(
+                                    title = if (showArchived) "HIDE ARCHIVED" else "ARCHIVED (${archived.size})",
+                                    subtitle = if (showArchived) null else "Hold a book to archive or restart it",
+                                    onClick = viewModel::toggleShowArchived,
+                                    lighten = true,
+                                )
+                                if (showArchived) {
+                                    archived.forEach { row ->
+                                        MenuRow(
+                                            title = row.book.title,
+                                            subtitle = row.status,
+                                            onClick = { openBook(row.book) },
+                                            onLongClick = { openOptions(row) },
+                                            lighten = true,
+                                        )
+                                    }
+                                }
+                            } else {
+                                LightText(
+                                    text = "Hold a book to archive or restart it",
+                                    variant = LightTextVariant.Superfine,
+                                    lighten = true,
+                                    modifier = Modifier.padding(vertical = 0.75f.gridUnitsAsDp()),
                                 )
                             }
                         }
@@ -230,20 +288,29 @@ private fun EmptyLibrary() {
     }
 }
 
+/** A library row: tap to open, hold for options. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MenuRow(
     title: String,
     subtitle: String? = null,
     detail: String? = null,
+    lighten: Boolean = false,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
+    val clickable = if (onLongClick == null) {
+        Modifier.lightClickable(onClick = onClick)
+    } else {
+        Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    }
     Column(
         Modifier
             .fillMaxWidth()
-            .lightClickable(onClick = onClick)
+            .then(clickable)
             .padding(vertical = 0.6f.gridUnitsAsDp()),
     ) {
-        LightText(text = title, variant = LightTextVariant.Copy, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        LightText(text = title, variant = LightTextVariant.Copy, lighten = lighten, maxLines = 2, overflow = TextOverflow.Ellipsis)
         subtitle?.let {
             LightText(text = it, variant = LightTextVariant.Fine, lighten = true, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
