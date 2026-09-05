@@ -18,6 +18,25 @@ book, which the stock Music tool doesn't (it restarts long files from zero every
   ("42% · 3:12:05 left") with a **Continue** shortcut for the most recent book.
 - **Restart** a book from the player screen (tap twice).
 
+## Chapters
+
+Books reads the chapter markers already inside your files and shows a table of contents
+(the CHAPTERS control on the player, or tap the chapter title). The player's progress bar
+and clocks describe the current chapter; the outer bottom-bar buttons step through chapters
+(back goes to the start of this chapter, or to the previous one when you are within 3 s of
+the start), and the sleep timer's last setting is "end of chapter".
+
+Where the markers come from:
+
+- **Libation MP3 exports** ("Download my books as .MP3 files") keep Audible's chapters as
+  ID3v2 `CHAP` frames inside the single file. Nothing extra to do; it is what you already have.
+- **Libation M4B exports** (the default, "original audio format") carry them as MP4 chapter
+  tables (Nero `chpl` and the QuickTime chapter track). Both are read.
+- **Folder books** with one file per chapter (Libation's "Split my books into multiple files
+  by chapter") work too: each file is a chapter, named after the file. You do not need this
+  option for chapters to work; the single-file exports are simpler to manage.
+- A single file with no markers is one chapter, and the chapter controls stay hidden.
+
 ## Getting books on the phone
 
 Books live in the phone's shared `Audiobooks` folder. Supported: mp3, m4a, m4b, aac, ogg,

@@ -40,12 +40,7 @@ import kotlinx.coroutines.launch
 class PlayerViewModel : LightViewModel<Unit>() {
     /** Ticks once a second while visible so the sleep countdown moves. */
     val now = MutableStateFlow(System.currentTimeMillis())
-
-    /** The restart control asks for a second tap within a few seconds. */
-    val confirmingRestart = MutableStateFlow(false)
-
     private var tickJob: Job? = null
-    private var confirmJob: Job? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         tickJob?.cancel()
@@ -60,22 +55,6 @@ class PlayerViewModel : LightViewModel<Unit>() {
     override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
         tickJob?.cancel()
         tickJob = null
-    }
-
-    fun tapRestart() {
-        val book = Playback.book.value ?: return
-        if (confirmingRestart.value) {
-            confirmJob?.cancel()
-            confirmingRestart.value = false
-            Playback.restart(book)
-        } else {
-            confirmingRestart.value = true
-            confirmJob?.cancel()
-            confirmJob = viewModelScope.launch {
-                delay(3_000L)
-                confirmingRestart.value = false
-            }
-        }
     }
 }
 
@@ -93,17 +72,33 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
         val position by Playback.positionMs.collectAsState()
         val duration by Playback.durationMs.collectAsState()
         val part by Playback.partIndex.collectAsState()
+        val chapters by Playback.chapters.collectAsState()
+        val chapter by Playback.currentChapter.collectAsState()
         val speed by Playback.speed.collectAsState()
         val sleepEndsAt by Playback.sleepEndsAt.collectAsState()
+        val sleepAtChapterEnd by Playback.sleepAtChapterEnd.collectAsState()
         val error by Playback.error.collectAsState()
         val fault by Playback.fault.collectAsState()
         val now by viewModel.now.collectAsState()
-        val confirming by viewModel.confirmingRestart.collectAsState()
         val loading by Playback.loading.collectAsState()
 
         val current = book
         val partCount = current?.files?.size ?: 0
-        val partLine = if (current != null && partCount > 1 && part >= 0) "Part ${part + 1} of $partCount" else ""
+        val navigable = BookChapters.isNavigable(chapters)
+        val ch = chapter
+
+        // With chapters, the bar and the clocks describe the chapter; otherwise the file.
+        val windowStart = if (navigable && ch != null) ch.startMs else 0L
+        val windowEnd = if (navigable && ch != null && ch.endMs > ch.startMs) minOf(ch.endMs, if (duration > 0L) duration else ch.endMs) else duration
+        val windowLen = (windowEnd - windowStart).coerceAtLeast(0L)
+        val elapsed = (position - windowStart).coerceIn(0L, windowLen)
+
+        val subline = when {
+            current == null -> ""
+            navigable && ch != null -> "Chapter ${ch.index + 1} of ${chapters.size}"
+            partCount > 1 && part >= 0 -> "Part ${part + 1} of $partCount"
+            else -> ""
+        }
 
         LightTheme(colors = colors) {
             Column(
@@ -126,12 +121,23 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
                     LightText(
                         text = current?.title ?: "Nothing playing",
                         variant = LightTextVariant.Heading,
-                        maxLines = 4,
+                        maxLines = 3,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (partLine.isNotEmpty()) {
+                    if (navigable && ch != null) {
                         LightText(
-                            text = partLine,
+                            text = ch.title,
+                            variant = LightTextVariant.Copy,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .padding(top = 0.5f.gridUnitsAsDp())
+                                .lightClickable { navigateTo(::ChaptersScreen) },
+                        )
+                    }
+                    if (subline.isNotEmpty()) {
+                        LightText(
+                            text = subline,
                             variant = LightTextVariant.Fine,
                             lighten = true,
                             maxLines = 1,
@@ -143,19 +149,19 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
 
                     LightTouchableProgressBar(
                         colors = LightThemeTokens.colors,
-                        progress = if (duration > 0L) position.toFloat() / duration else 0f,
-                        onValueChange = { fraction -> if (duration > 0L) Playback.seekTo((fraction * duration).toLong()) },
+                        progress = if (windowLen > 0L) elapsed.toFloat() / windowLen else 0f,
+                        onValueChange = { fraction -> if (windowLen > 0L) Playback.seekTo(windowStart + (fraction * windowLen).toLong()) },
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Row(Modifier.fillMaxWidth()) {
                         LightText(
-                            text = if (loading) "Opening…" else formatDuration(position),
+                            text = if (loading) "Opening…" else formatDuration(elapsed),
                             variant = LightTextVariant.Fine,
                             monospace = true,
                             modifier = Modifier.weight(1f),
                         )
                         LightText(
-                            text = if (duration > 0L && !loading) "-" + formatDuration(duration - position) else "--:--",
+                            text = if (windowLen > 0L && !loading) "-" + formatDuration(windowLen - elapsed) else "--:--",
                             variant = LightTextVariant.Fine,
                             monospace = true,
                             align = TextAlign.End,
@@ -183,16 +189,19 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
                         Option("SPEED", speedLabel(speed), Modifier.weight(1f), Playback::cycleSpeed)
                         Option(
                             "SLEEP",
-                            if (sleepEndsAt > now) formatDuration(sleepEndsAt - now) else "off",
+                            when {
+                                sleepAtChapterEnd -> "chapter"
+                                sleepEndsAt > now -> formatDuration(sleepEndsAt - now)
+                                else -> "off"
+                            },
                             Modifier.weight(1f),
                             Playback::cycleSleep,
                         )
                         Option(
-                            "RESTART",
-                            if (confirming) "tap again" else "book",
+                            "CHAPTERS",
+                            if (navigable) "${chapters.size}" else if (chapters.isEmpty()) "…" else "none",
                             Modifier.weight(1f),
-                            viewModel::tapRestart,
-                        )
+                        ) { if (navigable) navigateTo(::ChaptersScreen) }
                     }
                 }
 
@@ -200,8 +209,12 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
                     items = listOf(
                         LightBarButton.LightIcon(
                             LightIcons.REWIND,
-                            { Playback.previousPart() }.takeIf { partCount > 1 },
-                            contentDescription = "Previous part",
+                            when {
+                                navigable -> ({ Playback.previousChapter() })
+                                partCount > 1 -> ({ Playback.previousPart() })
+                                else -> null
+                            },
+                            contentDescription = "Previous chapter",
                         ),
                         LightBarButton.LightIcon(
                             LightIcons.SKIP_BACKWARD_FIFTEEN,
@@ -217,8 +230,12 @@ class PlayerScreen(sealedActivity: SealedLightActivity) :
                         ),
                         LightBarButton.LightIcon(
                             LightIcons.FAST_FORWARD,
-                            { Playback.nextPart() }.takeIf { partCount > 1 },
-                            contentDescription = "Next part",
+                            when {
+                                navigable -> ({ Playback.nextChapter() })
+                                partCount > 1 -> ({ Playback.nextPart() })
+                                else -> null
+                            },
+                            contentDescription = "Next chapter",
                         ),
                     ),
                 )

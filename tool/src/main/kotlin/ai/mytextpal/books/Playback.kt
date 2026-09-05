@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
@@ -76,8 +77,20 @@ object Playback {
         .flatMapLatest { it?.error ?: flowOf(null) }
         .stateIn(scope, SharingStarted.Eagerly, null)
 
+    /** Table of contents for the open book (one entry per file when files have no markers). */
+    private val _chapters = MutableStateFlow<List<BookChapter>>(emptyList())
+    val chapters: StateFlow<List<BookChapter>> = _chapters.asStateFlow()
+
+    val currentChapter: StateFlow<BookChapter?> = combine(_chapters, partIndex, positionMs) { list, part, pos ->
+        if (part < 0) null else BookChapters.at(list, part, pos)
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
     private val _speed = MutableStateFlow(1f)
     val speed: StateFlow<Float> = _speed.asStateFlow()
+
+    /** Sleep timer variant: pause when the current chapter ends. */
+    private val _sleepAtChapterEnd = MutableStateFlow(false)
+    val sleepAtChapterEnd: StateFlow<Boolean> = _sleepAtChapterEnd.asStateFlow()
 
     /** Epoch ms when the sleep timer pauses playback; 0 = no timer. */
     private val _sleepEndsAt = MutableStateFlow(0L)
@@ -123,6 +136,45 @@ object Playback {
         scope.launch {
             partIndex.drop(1).collect { if (it >= 0) saveNow() }
         }
+        scope.launch {
+            // "Sleep at end of chapter": the moment the chapter index moves on, stop.
+            var last: Int? = null
+            currentChapter.collect { ch ->
+                val idx = ch?.index
+                if (_sleepAtChapterEnd.value && last != null && idx != null && idx != last && isPlaying.value) {
+                    playerFlow.value?.pause()
+                    _sleepAtChapterEnd.value = false
+                }
+                last = idx
+            }
+        }
+    }
+
+    /** Jump to chapter [index] of the open book and play. Same file: a seek; other file: a reload. */
+    fun jumpToChapter(index: Int) {
+        val book = _book.value ?: return
+        val ch = _chapters.value.getOrNull(index) ?: return
+        scope.launch {
+            val player = playerFlow.value
+            if (player != null && player.currentMediaItemIndex.value == ch.fileIndex && !isLoading) {
+                player.seekTo(ch.startMs)
+                player.play()
+            } else {
+                loadAndPlay(book, StartPoint(ch.fileIndex, ch.startMs, _speed.value))
+            }
+        }
+    }
+
+    fun nextChapter() {
+        val ch = currentChapter.value ?: return
+        jumpToChapter(ch.index + 1)
+    }
+
+    /** Back to the start of this chapter, or to the previous one when already near its start. */
+    fun previousChapter() {
+        val ch = currentChapter.value ?: return
+        val intoChapter = positionMs.value - ch.startMs
+        if (intoChapter > 3_000L || ch.index == 0) jumpToChapter(ch.index) else jumpToChapter(ch.index - 1)
     }
 
     /** Start (or continue) [book] from where the listener left off. */
@@ -164,13 +216,25 @@ object Playback {
         scope.launch { saveNow() }
     }
 
+    /** off → 15 → 30 → 45 → 60 min → end of chapter (when the book has chapters) → off. */
     fun cycleSleep() {
+        if (_sleepAtChapterEnd.value) {
+            setSleep(0L)
+            return
+        }
         val remaining = (_sleepEndsAt.value - System.currentTimeMillis()).coerceAtLeast(0L)
-        setSleep(nextSleepMs(remaining))
+        val next = nextSleepMs(remaining)
+        if (next == 0L && BookChapters.isNavigable(_chapters.value)) {
+            setSleep(0L)
+            _sleepAtChapterEnd.value = true
+        } else {
+            setSleep(next)
+        }
     }
 
     fun setSleep(ms: Long) {
         sleepJob?.cancel()
+        _sleepAtChapterEnd.value = false
         if (ms <= 0L) {
             _sleepEndsAt.value = 0L
             return
@@ -209,13 +273,15 @@ object Playback {
         player.play()
     }
 
-    private suspend fun loadAndPlay(book: Book) {
+    /** Load [book]'s queue and play from [at], or from the saved spot when [at] is null. */
+    private suspend fun loadAndPlay(book: Book, at: StartPoint? = null) {
         val store = store ?: return
         _loading.value = true
         val player = ensurePlayer() ?: run { _loading.value = false; return }
         try {
+            if (_book.value?.id != book.id) _chapters.value = emptyList()
             _book.value = book
-            val start = startPoint(store.load(book.id), book.files.size, System.currentTimeMillis())
+            val start = at ?: startPoint(store.load(book.id), book.files.size, System.currentTimeMillis())
             _speed.value = start.speed
             player.speed = start.speed
             player.setMediaQueue(book.toQueue(), start.fileIndex)
@@ -229,6 +295,12 @@ object Playback {
             player.play()
         } finally {
             _loading.value = false
+        }
+        if (_chapters.value.isEmpty()) {
+            // Read (or fetch from cache) after playback has started so it never delays the audio.
+            val embedded = store.chapters(book)
+            val durations = store.partDurations(book)
+            if (_book.value?.id == book.id) _chapters.value = BookChapters.assemble(book, embedded, durations)
         }
     }
 

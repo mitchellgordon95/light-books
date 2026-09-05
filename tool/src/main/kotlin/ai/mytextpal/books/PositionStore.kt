@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringSetPreferencesKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 /**
@@ -57,6 +58,23 @@ class PositionStore(private val dataStore: DataStore<Preferences>) {
         return result
     }
 
+    /** Embedded chapters per file, cached because reading them opens the file. */
+    suspend fun chapters(book: Book): List<List<Chapter>> {
+        val prefs = dataStore.data.first()
+        val missing = mutableMapOf<Preferences.Key<String>, String>()
+        val result = withContext(Dispatchers.IO) {
+            book.files.map { file ->
+                val key = stringPreferencesKey(CHAP_PREFIX + Library.durationKey(file))
+                prefs[key]?.let { raw -> runCatching { json.decodeFromString(chapterListSerializer, raw) }.getOrNull() }
+                    ?: ChapterReader.read(file).also { missing[key] = json.encodeToString(chapterListSerializer, it) }
+            }
+        }
+        if (missing.isNotEmpty()) {
+            dataStore.edit { prefs -> missing.forEach { (k, v) -> prefs[k] = v } }
+        }
+        return result
+    }
+
     /** Ids of books hidden from the main list. Positions are kept, so unarchiving resumes. */
     suspend fun archived(): Set<String> = dataStore.data.first()[ARCHIVED_KEY].orEmpty()
 
@@ -70,9 +88,12 @@ class PositionStore(private val dataStore: DataStore<Preferences>) {
     private fun decode(raw: String): SavedPosition? =
         runCatching { json.decodeFromString(SavedPosition.serializer(), raw) }.getOrNull()
 
+    private val chapterListSerializer = ListSerializer(Chapter.serializer())
+
     private companion object {
         const val POS_PREFIX = "pos:"
         const val DUR_PREFIX = "dur:"
+        const val CHAP_PREFIX = "chp:"
         val ARCHIVED_KEY = stringSetPreferencesKey("archived")
     }
 }
