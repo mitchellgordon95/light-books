@@ -1,8 +1,8 @@
 [tool]
 id = "ai.mytextpal.books"
 label = "Books"
-versionCode = 2
-versionName = "0.2.0"
+versionCode = 3
+versionName = "0.2.1"
 orientation = "portrait"
 permissions = [
     # Reading /sdcard/Audiobooks. On the SDK's allowed list; LightOS asks the
