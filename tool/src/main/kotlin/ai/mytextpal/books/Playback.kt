@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
@@ -48,6 +49,14 @@ object Playback {
     private const val SAVE_INTERVAL_MS = 5_000L
     private const val IDLE_RELEASE_MS = 10 * 60_000L
     private const val PREPARE_TIMEOUT_MS = 8_000L
+    /** Keep trying a resume seek this long before giving up and letting saves through. */
+    private const val SEEK_GIVE_UP_MS = 60_000L
+    private const val SEEK_RETRY_MS = 250L
+    private const val SEEK_TOLERANCE_MS = 1_500L
+    /** The SDK polls the position every 250 ms; a part change shows up before the next poll. */
+    private const val POSITION_SETTLE_MS = 400L
+    private const val SAVE_DEBOUNCE_MS = 1_000L
+    private const val SEEK_ATTEMPTS = 8
     const val SKIP_MS = 15_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -107,7 +116,21 @@ object Playback {
     private var pausedAt = 0L
     private var idleJob: Job? = null
     private var sleepJob: Job? = null
-    private val isLoading: Boolean get() = _loading.value
+    private var saveSoonJob: Job? = null
+    /** Queue loads in flight; saves are held while any is. Overlapping loads happen on double taps. */
+    private var loadsInFlight = 0
+    private val isLoading: Boolean get() = loadsInFlight > 0
+
+    /**
+     * A resume seek we have issued but not yet seen land. The SDK clamps seeks to zero until
+     * the part reports its duration, so a save in that window would overwrite the listener's
+     * real spot with the start of the file. Saves are held until this clears.
+     */
+    private var pendingSeekMs: Long? = null
+    private var seekJob: Job? = null
+
+    /** Set by a chapter jump so "sleep at end of chapter" ignores that one boundary. */
+    private var skipChapterSleepOnce = false
 
     /** Called by the first screen. Later calls just refresh the audio factory (new activity). */
     fun start(audio: LightAudio, store: PositionStore) {
@@ -134,16 +157,27 @@ object Playback {
             }
         }
         scope.launch {
-            partIndex.drop(1).collect { if (it >= 0) saveNow() }
+            // The index moves before the next position poll, so saving at once would pair the
+            // new part with the old part's end. Let the position catch up first.
+            partIndex.drop(1).collectLatest { index ->
+                if (index < 0) return@collectLatest
+                delay(POSITION_SETTLE_MS)
+                saveNow()
+            }
         }
         scope.launch {
-            // "Sleep at end of chapter": the moment the chapter index moves on, stop.
+            // "Sleep at end of chapter": the moment the chapter index moves on, stop — unless
+            // the listener moved it themselves.
             var last: Int? = null
             currentChapter.collect { ch ->
                 val idx = ch?.index
-                if (_sleepAtChapterEnd.value && last != null && idx != null && idx != last && isPlaying.value) {
-                    playerFlow.value?.pause()
-                    _sleepAtChapterEnd.value = false
+                if (last != null && idx != null && idx != last) {
+                    if (skipChapterSleepOnce) {
+                        skipChapterSleepOnce = false
+                    } else if (_sleepAtChapterEnd.value && isPlaying.value) {
+                        playerFlow.value?.pause()
+                        _sleepAtChapterEnd.value = false
+                    }
                 }
                 last = idx
             }
@@ -155,9 +189,10 @@ object Playback {
         val book = _book.value ?: return
         val ch = _chapters.value.getOrNull(index) ?: return
         scope.launch {
+            if (ch.index != currentChapter.value?.index) skipChapterSleepOnce = true
             val player = playerFlow.value
             if (player != null && player.currentMediaItemIndex.value == ch.fileIndex && !isLoading) {
-                player.seekTo(ch.startMs)
+                seekTo(ch.startMs)
                 player.play()
             } else {
                 loadAndPlay(book, StartPoint(ch.fileIndex, ch.startMs, _speed.value))
@@ -180,9 +215,13 @@ object Playback {
     /** Start (or continue) [book] from where the listener left off. */
     fun open(book: Book) {
         scope.launch {
-            if (_book.value?.id == book.id && playerFlow.value != null && !isLoading) {
-                if (!isPlaying.value) resume()
-                return@launch
+            if (_book.value?.id == book.id) {
+                // Already open: a second tap while it loads is a no-op, otherwise just play.
+                if (isLoading) return@launch
+                if (playerFlow.value != null) {
+                    if (!isPlaying.value) resume()
+                    return@launch
+                }
             }
             saveNow()
             loadAndPlay(book)
@@ -194,8 +233,13 @@ object Playback {
         if (player != null && isPlaying.value) player.pause() else scope.launch { resume() }
     }
 
+    /** An explicit seek by the listener. Wins over any resume seek still pending. */
     fun seekTo(ms: Long) {
-        playerFlow.value?.seekTo(ms.coerceIn(0L, durationMs.value.coerceAtLeast(0L)))
+        val player = playerFlow.value ?: return
+        clearPendingSeek()
+        player.seekTo(ms.coerceIn(0L, durationMs.value.coerceAtLeast(0L)))
+        // The playing ticker would get this within 5 s; a seek while paused has nobody else.
+        saveSoon()
     }
 
     fun skip(deltaMs: Long) = seekTo(positionMs.value + deltaMs)
@@ -250,11 +294,15 @@ object Playback {
     /** Forget the saved spot and start [book] from the top. */
     fun restart(book: Book) {
         scope.launch {
-            store?.clear(book.id)
-            if (_book.value?.id == book.id) {
+            val isOpen = _book.value?.id == book.id
+            // Drop the book first: a save tick landing while the store is cleared would otherwise
+            // write the old spot straight back and the restart would silently not happen.
+            if (isOpen) {
+                clearPendingSeek()
                 _book.value = null
-                loadAndPlay(book)
             }
+            store?.clear(book.id)
+            if (isOpen) loadAndPlay(book)
         }
     }
 
@@ -268,7 +316,9 @@ object Playback {
             loadAndPlay(book)
             return
         }
-        val rewind = resumeRewindMs(System.currentTimeMillis() - pausedAt)
+        // pausedAt is 0 when nothing has paused since the load (play never started, say); the
+        // load already applied its own rewind, so don't add another 30 s on top.
+        val rewind = if (pausedAt > 0L) resumeRewindMs(System.currentTimeMillis() - pausedAt) else 0L
         if (rewind > 0L && positionMs.value > 0L) player.seekTo((positionMs.value - rewind).coerceAtLeast(0L))
         player.play()
     }
@@ -276,31 +326,77 @@ object Playback {
     /** Load [book]'s queue and play from [at], or from the saved spot when [at] is null. */
     private suspend fun loadAndPlay(book: Book, at: StartPoint? = null) {
         val store = store ?: return
+        clearPendingSeek()
+        loadsInFlight++
         _loading.value = true
-        val player = ensurePlayer() ?: run { _loading.value = false; return }
         try {
+            val player = ensurePlayer() ?: return
             if (_book.value?.id != book.id) _chapters.value = emptyList()
             _book.value = book
+            pausedAt = 0L
             val start = at ?: startPoint(store.load(book.id), book.files.size, System.currentTimeMillis())
             _speed.value = start.speed
             player.speed = start.speed
             player.setMediaQueue(book.toQueue(), start.fileIndex)
             if (start.posMs > 0L) {
-                // seekTo clamps to the resolved duration, so wait until the part is prepared.
+                pendingSeekMs = start.posMs
                 val t0 = System.currentTimeMillis()
-                val known = withTimeoutOrNull(PREPARE_TIMEOUT_MS) { player.durationMs.first { it > 0L } }
-                Log.i(TAG, "Prepared wait: ${System.currentTimeMillis() - t0} ms, duration=$known, index=${player.currentMediaItemIndex.value}")
-                player.seekTo(start.posMs)
+                val landed = withTimeoutOrNull(PREPARE_TIMEOUT_MS) { seekWhenPrepared(player, start.posMs) }
+                Log.i(TAG, "Resume seek to ${start.posMs}: landed=$landed after ${System.currentTimeMillis() - t0} ms")
+                if (landed == true) {
+                    pendingSeekMs = null
+                } else {
+                    // Still not prepared. Start the audio rather than hang, keep trying behind
+                    // it, and hold saves until the seek lands (see pendingSeekMs).
+                    seekJob = scope.launch {
+                        val ok = withTimeoutOrNull(SEEK_GIVE_UP_MS) { seekWhenPrepared(player, start.posMs) }
+                        if (ok != true) Log.w(TAG, "Gave up resuming at ${start.posMs}; saving from the live position")
+                        if (pendingSeekMs == start.posMs) pendingSeekMs = null
+                    }
+                }
             }
             player.play()
         } finally {
-            _loading.value = false
+            loadsInFlight--
+            _loading.value = isLoading
         }
         if (_chapters.value.isEmpty()) {
             // Read (or fetch from cache) after playback has started so it never delays the audio.
             val embedded = store.chapters(book)
             val durations = store.partDurations(book)
             if (_book.value?.id == book.id) _chapters.value = BookChapters.assemble(book, embedded, durations)
+        }
+    }
+
+    /**
+     * Seeks to [posMs] once the part reports a duration (the SDK clamps seeks to zero before
+     * that) and confirms the seek took. A stale duration from the previous queue makes the
+     * first attempt clamp; the retry catches it. Returns false after too many misses.
+     */
+    private suspend fun seekWhenPrepared(player: LightAudioPlayer, posMs: Long): Boolean {
+        repeat(SEEK_ATTEMPTS) { attempt ->
+            val duration = player.durationMs.first { it > 0L }
+            val target = minOf(posMs, duration)
+            player.seekTo(target)
+            // seekTo refreshes positionMs synchronously, so a clamped seek reads as ~0 right away.
+            if (player.positionMs.value >= target - SEEK_TOLERANCE_MS) return true
+            Log.w(TAG, "Seek to $target read back ${player.positionMs.value} (duration $duration, attempt $attempt)")
+            delay(SEEK_RETRY_MS)
+        }
+        return false
+    }
+
+    private fun clearPendingSeek() {
+        seekJob?.cancel()
+        seekJob = null
+        pendingSeekMs = null
+    }
+
+    private fun saveSoon() {
+        saveSoonJob?.cancel()
+        saveSoonJob = scope.launch {
+            delay(SAVE_DEBOUNCE_MS)
+            saveNow()
         }
     }
 
@@ -328,8 +424,9 @@ object Playback {
         val store = store ?: return
         val book = _book.value ?: return
         val index = partIndex.value
-        // While a queue is being swapped in, the flows briefly describe the wrong book.
-        if (index < 0 || isLoading) return
+        // While a queue is being swapped in, the flows briefly describe the wrong book; while a
+        // resume seek is pending, the position is the start of the file, not the listener's.
+        if (index < 0 || isLoading || pendingSeekMs != null) return
         val finished = isBookFinished(index, book.files.size, positionMs.value, durationMs.value) && !isPlaying.value
         store.save(
             book.id,
